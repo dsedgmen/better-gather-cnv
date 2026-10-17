@@ -66,10 +66,22 @@ bats-test: $(BATS)
 
 .PHONY: bats-lint
 bats-lint: $(SHELLCHECK)
-	find $(CNV_SCRIPT_DIRS) -type f -exec grep -Eq '^#!/' {} \; -exec $(SHELLCHECK) -x {} +
+# -e SC2016,SC2317 matches upstream's own `check` target: the collection
+# scripts deliberately use single-quoted expressions for remote shells.
+# -e SC2329 as well: several functions here are invoked indirectly, through
+# `xargs ... sh -c`, which shellcheck cannot see.
+# vendor/ is third-party Go tooling that happens to contain shell scripts.
+# Unlike upstream's `collection-scripts/*` glob, the shebang test also keeps
+# incident_metrics.conf -- a config file, not a script -- out of the lint.
+	find $(CNV_SCRIPT_DIRS) -type f -not -path '*/vendor/*' \
+		-exec grep -Eq '^#!/' {} \; \
+		-exec $(SHELLCHECK) -x --source-path=./collection-scripts \
+			-e SC2016 -e SC2317 -e SC2329 {} +
 
-.PHONY: check
-check: bats-test
+# NB: upstream already defines a `check` target, so these are namespaced
+# rather than overriding it.
+.PHONY: bats-check
+bats-check: bats-lint bats-test
 
 .PHONY: image-overlay
 image-overlay:
