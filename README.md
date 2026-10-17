@@ -63,6 +63,43 @@ since-report.txt:
 The window is the only thing that changes; the virsh dumps, capabilities and
 domain XML are collected either way.
 
+### The node audit log
+
+Verified against a real `/var/log/audit/audit.log` (16,478 records spanning
+six weeks) on all three nodes, through the full `gather_nodes` path with the
+node-gather DaemonSet:
+
+```
+filter applied directly to the file, GNU Awk 5.1.0:
+  window     kept    oldest kept             violations
+  1h          848    2026-10-16T23:53:48Z    0
+  24h        1313    2026-10-16T01:14:18Z    0
+  30d       12505    2026-09-17T01:01:32Z    0
+  unbounded 16478    2026-09-04T09:39:54Z    0      (all of them: a no-op)
+
+through gather_nodes --since 1h, three nodes:
+  master-0  860 lines  23:56:14Z .. 00:55:07Z
+  master-1  728 lines  23:56:19Z .. 00:55:07Z
+  master-2  763 lines  23:56:19Z .. 00:55:08Z
+
+with no window, the whole file is collected as before:
+  master-0  16514 lines, oldest 2026-09-04T09:39:54Z
+  master-2  24153 lines, oldest 2026-09-04T09:26:10Z
+```
+
+Zero records older than the cutoff survived at any window.
+
+Why the cap moved from `head` to `tail`, on that same file:
+
+```
+  head -c 200000  ->  2026-09-04T09:39:54Z .. 2026-09-04T09:55:15Z
+  tail -c 200000  ->  2026-10-16T23:59:13Z .. 2026-10-17T00:54:14Z
+```
+
+`head -c` returns the *start* of the file. On any node whose audit log has
+grown past the 50 MB cap, upstream hands you records from weeks before the
+incident you are investigating.
+
 ## Testing a change
 
 ```console
