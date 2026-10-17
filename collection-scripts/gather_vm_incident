@@ -459,11 +459,12 @@ if [[ -n "${LAUNCHER_POD}" ]]; then
             > "${VM_DETAIL_PATH}/${LAUNCHER_POD}.domblkerror" 2>&1
 
         # Cap QEMU log transfer at 50 MB to prevent archive bloat on long-running VMs
+        # find-filtered file list rather than whole directories, so --since
+        # bounds the transfer. Without a window the predicate is empty and
+        # this is the original command. The 50 MB cap stays as a backstop.
+        # shellcheck disable=SC2086
         timeout 60 /usr/bin/oc exec "${LAUNCHER_POD}" -n "${NS}" -c compute -- \
-            tar --ignore-failed-read -cf - \
-            "/var/log/libvirt/qemu/" \
-            "/var/run/libvirt/qemu/log/" \
-            "/var/run/kubevirt-private/libvirt/qemu/log/" 2>/dev/null \
+            sh -c "cd / && find 'var/log/libvirt/qemu' 'var/run/libvirt/qemu/log' 'var/run/kubevirt-private/libvirt/qemu/log' -type f $(since_find_predicate) -print0 2>/dev/null | tar --ignore-failed-read -cf - --null -T -" 2>/dev/null \
             | head -c 50000000 \
             | tar -C "${VM_DETAIL_PATH}" \
                 --transform 'flags=r;s|^var/log/libvirt/qemu/||' \

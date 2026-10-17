@@ -1,3 +1,109 @@
+better-gather-cnv
+=================
+
+A fork of [kubevirt/must-gather](https://github.com/kubevirt/must-gather) in
+which `--since` bounds the QEMU and node log collection. Sibling of
+[better-gather](https://github.com/dsedgmen/better-gather) (OpenShift) and
+[better-gather-odf](https://github.com/dsedgmen/better-gather-odf).
+
+## What was wrong
+
+`collection-scripts/common.sh` is a copy of openshift/must-gather's, so it
+carried the same duration bug: collapsing a Go duration for `oc adm node-logs`
+by keeping only its first component. `2h30m` became `-2h`, silently dropping
+the oldest thirty minutes of the window, and `500ms` became `-500m`, read as
+500 minutes. That reaches the real `node-logs -u NetworkManager` and
+`-u kubelet` journal queries in `gather_nodes`.
+
+The 24 `oc adm inspect ${log_collection_args}` call sites were already fine.
+The gaps were the collection that copies files:
+
+- `gather_vms_details` and `gather_vm_incident` tar whole QEMU log
+  directories out of the `compute` container —
+  `tar --ignore-failed-read -cf - /var/log/libvirt/qemu/
+  /var/run/libvirt/qemu/log/ /var/run/kubevirt-private/libvirt/qemu/log/` —
+  with no time bound at all.
+- `gather_nodes` took the node audit log with `head -c 50000000`, which is
+  the **oldest** 50 MB of the file. Independent of `--since`, that is
+  backwards for incident analysis and explains a capped `audit.log` so often
+  containing nothing relevant.
+
+## What changed
+
+Durations are now collapsed exactly (`2h30m0s` → `-150m`, `500ms` → `-1s`),
+via the vendored `since_common.sh`.
+
+Both QEMU tar sites are fed a `find`-filtered file list instead of whole
+directories, so out-of-window logs are never transferred. The existing
+`--transform` rules are untouched — they already expected member names
+without a leading slash, which is exactly what a relative `find` produces.
+
+The node audit log is filtered on auditd's own `msg=audit(<epoch>.<ms>:<seq>)`
+timestamp, in POSIX awk so it works under mawk as well as gawk. Lines that
+carry no audit timestamp pass through untouched. The 50 MB cap is now applied
+with `tail`, so what survives is the most recent 50 MB rather than the oldest.
+
+`oc cp` of `/host/${conf_dir}` and `/host/etc/pcidp/config.json` is left
+alone: that is configuration, not history, and a window does not apply.
+
+## Measured on a live cluster
+
+OpenShift Virtualization 4.18.49 on OCP 4.18.54, one cirros VM whose QEMU log
+was last written at 00:01:39Z:
+
+```
+--since 5m   (cutoff 00:26)  ->  qemu logs collected: 0   other VM artefacts: 10
+--since 2h   (cutoff 22:33)  ->  qemu logs collected: 1   other VM artefacts: 10
+
+since-report.txt:
+  vms/bg-testvm/qemu_logs   find-newermt   kept=0   (5m)
+  vms/bg-testvm/qemu_logs   find-newermt   kept=1   (2h)
+```
+
+The window is the only thing that changes; the virsh dumps, capabilities and
+domain XML are collected either way.
+
+## Testing a change
+
+```console
+$ hack/try-on-cluster.sh --env USR_BIN_GATHER=1 gather_vms_details --since 30m
+$ hack/try-on-cluster.sh gather --since 30m -- --vms_details
+$ make bats-test && make bats-lint
+```
+
+`--env` exists because CNV's collection scripts are gated on
+`USR_BIN_GATHER`, which `gather` normally sets; running one on its own needs
+it. Note that `gather --vms_details` also brings up the node-gather
+DaemonSet, which takes its image from the running pod — so pass
+`--image <the cnv-must-gather image your cluster advertises>` when using the
+full entrypoint.
+
+`make bats-test` bootstraps `bats`, `shellcheck` and `shfmt` from the
+distribution via `hack/tools-from-packages.sh`, needing neither root nor
+GitHub.
+
+## The vendored library
+
+`collection-scripts/since_common.sh` is a verbatim copy of the canonical file
+in [better-gather](https://github.com/dsedgmen/better-gather); update it with
+`hack/sync-since-lib.sh` *in that repo*. `tests/vendored_lib.bats` fails on
+drift.
+
+One thing worth knowing if you extend this: the library `export -f`s its
+functions. CNV fans out with `xargs ... sh -c`, where a function from the
+parent shell is invisible, and the failure is silent —
+`$(since_find_predicate)` becomes empty, `find` runs unfiltered, and the
+window is ignored while everything looks like it worked. That cost two
+cluster runs before it was caught.
+
+## Staying current with upstream
+
+```console
+$ git fetch upstream && git rebase upstream/main
+```
+
+---
+
 # KubeVirt must-gather
 
 `must-gather` is a tool built on top of [OpenShift must-gather](https://github.com/openshift/must-gather)

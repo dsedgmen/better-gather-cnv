@@ -1,0 +1,13 @@
+# Layer better-gather-cnv's collection scripts onto an existing CNV
+# must-gather image, so the base is version-matched to the cluster under test
+# and needs no CI credentials.
+#
+#   make image-overlay BASE=<the cnv-must-gather image your cluster advertises>
+
+ARG BASE=quay.io/kubevirt/must-gather:latest
+FROM ${BASE}
+
+COPY collection-scripts/ /usr/bin/
+
+LABEL io.k8s.display-name="better-gather-cnv" \
+      io.k8s.description="CNV must-gather collection scripts that honour --since"

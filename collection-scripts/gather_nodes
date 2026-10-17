@@ -21,6 +21,8 @@ DIR_NAME=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 source "${DIR_NAME}/common.sh"
 check_command
 get_log_collection_args
+get_since_cutoff
+since_report_header
 
 MAX_PARALLEL_NODES=${MAX_PARALLEL_NODES:-5}
 
@@ -295,11 +297,33 @@ collect_node() {
 
     collect_virt_handler_ghost_records "${NODE_GATHER_POD}" "${NODE_PATH}"
 
-    # audit.log can be hundreds of MB; skip in incident mode, cap at 50 MB in default mode
+    # audit.log can be hundreds of MB; skip in incident mode, cap at 50 MB in
+    # default mode.
+    #
+    # auditd records carry their own timestamp as msg=audit(<epoch>.<ms>:<seq>),
+    # so --since can be applied exactly, with awk, rather than not at all.
+    #
+    # The cap is applied with tail rather than head. head -c takes the first
+    # 50 MB, which is the *oldest* part of the file -- the opposite of what
+    # anyone investigating an incident wants, and the reason a capped
+    # audit.log so often contained nothing relevant.
     if [[ -z "${TARGET_NODE}" ]]; then
         if timeout 10 /usr/bin/oc exec "${NODE_GATHER_POD}" -n node-gather -- [ -f /host/var/log/audit/audit.log ] 2>/dev/null; then
-            timeout 60 /usr/bin/oc exec "${NODE_GATHER_POD}" -n node-gather -- head -c 50000000 /host/var/log/audit/audit.log 2>/dev/null \
-                > "${NODE_PATH}/audit.log" || true
+            if since_window_requested; then
+                # since_cutoff_epoch comes from since_common.sh; the awk
+                # program is single-quoted on purpose, it is not shell.
+                # shellcheck disable=SC2154,SC2016
+                timeout 60 /usr/bin/oc exec "${NODE_GATHER_POD}" -n node-gather -- \
+                    awk -v cutoff="${since_cutoff_epoch}" \
+                        '{ if (match($0, /audit\([0-9]+\./)) { split(substr($0, RSTART + 6), a, "."); if (a[1] + 0 >= cutoff) print } else print }' \
+                        /host/var/log/audit/audit.log 2>/dev/null \
+                    | tail -c 50000000 > "${NODE_PATH}/audit.log" || true
+                since_report "nodes/${node}/audit.log" "auditd-epoch" "filtered" "pre-cutoff"
+            else
+                timeout 60 /usr/bin/oc exec "${NODE_GATHER_POD}" -n node-gather -- tail -c 50000000 /host/var/log/audit/audit.log 2>/dev/null \
+                    > "${NODE_PATH}/audit.log" || true
+                since_report "nodes/${node}/audit.log" "no-window-last-50MB" "all" "0"
+            fi
         fi
     fi
 

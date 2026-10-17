@@ -1,6 +1,12 @@
 #!/bin/bash -x
 
 DIR_NAME=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+# duration_to_node_logs_since, get_since_cutoff and the helpers that apply the
+# collection window to file-based collection. Vendored verbatim from
+# dsedgmen/better-gather; update it there with hack/sync-since-lib.sh.
+# shellcheck source=collection-scripts/since_common.sh
+source "${DIR_NAME}/since_common.sh"
 export BASE_COLLECTION_PATH="${BASE_COLLECTION_PATH:-/must-gather}"
 export PROS=${PROS:-5}
 export INSTALLATION_NAMESPACE=${INSTALLATION_NAMESPACE:-kubevirt-hyperconverged}
@@ -36,8 +42,12 @@ get_log_collection_args() {
 	node_log_collection_args=""
 
 	if [ -n "${MUST_GATHER_SINCE:-}" ]; then
-		# shellcheck disable=SC2001
-		since=$(echo "${MUST_GATHER_SINCE:-}" | sed 's/\([0-9]*[dhms]\).*/\1/')
+		# node-logs accepts a single '(+|-)[0-9]+(s|m|h|d)' component, so a
+		# multi-component duration has to be collapsed into one. Doing that
+		# by keeping only the first component, as this did, silently narrows
+		# the window: 2h30m becomes -2h and the oldest 30 minutes are never
+		# collected, and 500ms becomes -500m, read as 500 minutes.
+		since=$(duration_to_node_logs_since "${MUST_GATHER_SINCE}")
 		node_log_collection_args=--since="-${since}"
 	fi
 	if [ -n "${MUST_GATHER_SINCE_TIME:-}" ]; then

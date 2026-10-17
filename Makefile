@@ -40,3 +40,37 @@ test: test-build
 	tests/must-gather.test --ginkgo.label-filter=level:product --ginkgo.junit-report=${GINKGO_JUNIT_REPORT} --ginkgo.v
 
 .PHONY: build docker-build docker-push docker-multi-arch test-build test
+
+# ---------------------------------------------------------------------------
+# better-gather-cnv additions
+# ---------------------------------------------------------------------------
+
+LOCALBIN ?= $(shell pwd)/tmp/bin
+BATS ?= $(LOCALBIN)/bats
+SHELLCHECK ?= $(LOCALBIN)/shellcheck
+CNV_SCRIPT_DIRS := collection-scripts/ hack/ tests/
+
+OVERLAY_BASE ?= quay.io/kubevirt/must-gather:latest
+OVERLAY_IMAGE ?= better-gather-cnv:latest
+
+.PHONY: tools-from-packages
+tools-from-packages:
+	./hack/tools-from-packages.sh
+
+$(LOCALBIN)/%:
+	./hack/tools-from-packages.sh $*
+
+.PHONY: bats-test
+bats-test: $(BATS)
+	$(BATS) tests/*.bats
+
+.PHONY: bats-lint
+bats-lint: $(SHELLCHECK)
+	find $(CNV_SCRIPT_DIRS) -type f -exec grep -Eq '^#!/' {} \; -exec $(SHELLCHECK) -x {} +
+
+.PHONY: check
+check: bats-test
+
+.PHONY: image-overlay
+image-overlay:
+	podman build --build-arg BASE=$(OVERLAY_BASE) -t $(OVERLAY_IMAGE) -f Dockerfile.overlay .
