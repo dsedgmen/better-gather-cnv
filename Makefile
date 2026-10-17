@@ -74,7 +74,7 @@ bats-lint: $(SHELLCHECK)
 # Unlike upstream's `collection-scripts/*` glob, the shebang test also keeps
 # incident_metrics.conf -- a config file, not a script -- out of the lint.
 	find $(CNV_SCRIPT_DIRS) -type f -not -path '*/vendor/*' \
-		-exec grep -Eq '^#!/' {} \; \
+		-exec grep -Eq '^#!.*/(env +)?(ba|da|k|z)?sh\b' {} \; \
 		-exec $(SHELLCHECK) -x --source-path=./collection-scripts \
 			-e SC2016 -e SC2317 -e SC2329 {} +
 

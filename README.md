@@ -133,6 +133,57 @@ parent shell is invisible, and the failure is silent —
 window is ignored while everything looks like it worked. That cost two
 cluster runs before it was caught.
 
+## Images
+
+CI builds the overlay image and pushes it to ghcr.io on `main`, on every
+`release-*` branch, and on a `v*` tag. Pull requests build and smoke-test but
+publish nothing.
+
+| ref | tags |
+| --- | --- |
+| `main` | `:latest`, `:main-<sha>` |
+| `release-4.18` | `:4.18`, `:release-4.18` |
+| `v1.2.3` | `:v1.2.3`, `:latest` |
+
+A release branch deliberately does not move `:latest`, so `--image …:4.18`
+keeps getting the 4.18 collection scripts whatever happens on main.
+
+**The packages are private**, inheriting the repository's visibility, so a
+cluster needs a pull secret. Create one in the namespace must-gather will run
+in, with a PAT that has `read:packages`:
+
+```console
+$ oc create namespace must-gather-run
+$ oc create secret docker-registry ghcr \
+    --docker-server=ghcr.io \
+    --docker-username=dsedgmen \
+    --docker-password=<PAT with read:packages> \
+    -n must-gather-run
+$ oc secrets link default ghcr --for=pull -n must-gather-run
+
+$ oc adm must-gather \
+    --run-namespace must-gather-run \
+    --image=ghcr.io/dsedgmen/better-gather-cnv:4.18 \
+    --since 30m
+```
+
+`--run-namespace` matters: without it the pod runs in a fresh temporary
+namespace that has no pull secret.
+
+To avoid the secret entirely, make the package public in the repository's
+package settings — note that publishes the collection scripts, since they are
+in the image layers.
+
+## Release branches
+
+None. Upstream's release branches stop at `release-4.12` and development
+happens on `main`, so there is no 4.18–4.23 branch to backport onto. The
+sibling forks have `release-4.18`+ because their upstreams do.
+
+If CNV ever needs per-release pinning, the honest way is a tag on `main`
+rather than a branch invented here — a `release-4.18` identical to `main`
+would imply a backport that does not exist.
+
 ## Staying current with upstream
 
 ```console
