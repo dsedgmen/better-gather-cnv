@@ -180,7 +180,58 @@ load test_helper
 		since_find_predicate
 	"
 	assert_success
-	assert_output "-newermt @1792141200"
+	assert_output --partial "-newermt @1792141200"
+}
+
+@test "the window keeps a live log even when nothing was written during it" {
+	# mtime says when a file was last written, not what period it covers.
+	# A VM whose QEMU log was last written half an hour ago is still running,
+	# and dropping its only log leaves nothing at all for that VM. The same
+	# would empty /var/log/ceph on an idle cluster.
+	mkdir -p "$TEST_TMPDIR/logs"
+	touch -d '30 minutes ago' "$TEST_TMPDIR/logs/cnv-test_bg-testvm.log"
+	touch -d '30 minutes ago' "$TEST_TMPDIR/logs/ceph-osd.1.log"
+	touch -d '2 minutes ago' "$TEST_TMPDIR/logs/ceph-mon.a.log"
+
+	run bash -c "
+		export MUST_GATHER_SINCE=5m0s
+		source \"$SCRIPT_DIR/since_common.sh\"
+		get_since_cutoff
+		eval \"find '$TEST_TMPDIR/logs' -type f \$(since_find_predicate)\" | sed 's|.*/||' | sort
+	"
+	assert_success
+	assert_output "ceph-mon.a.log
+ceph-osd.1.log
+cnv-test_bg-testvm.log"
+}
+
+@test "the window still drops rotated and compressed copies" {
+	mkdir -p "$TEST_TMPDIR/rot"
+	touch -d '3 days ago' "$TEST_TMPDIR/rot/audit-2026-10-15T19-30-44.933.log"
+	touch -d '3 days ago' "$TEST_TMPDIR/rot/ceph-osd.1.log.gz"
+	touch -d '3 days ago' "$TEST_TMPDIR/rot/messages.1"
+	touch -d '3 days ago' "$TEST_TMPDIR/rot/live.log"
+
+	run bash -c "
+		export MUST_GATHER_SINCE=5m0s
+		source \"$SCRIPT_DIR/since_common.sh\"
+		get_since_cutoff
+		eval \"find '$TEST_TMPDIR/rot' -type f \$(since_find_predicate)\" | sed 's|.*/||' | sort
+	"
+	assert_success
+	# only the live one survives; the three archived copies do not
+	assert_output "live.log"
+}
+
+@test "the predicate is still empty without a window" {
+	run bash -c "
+		unset MUST_GATHER_SINCE MUST_GATHER_SINCE_TIME
+		source \"$SCRIPT_DIR/since_common.sh\"
+		get_since_cutoff
+		echo \"[\$(since_find_predicate)]\"
+	"
+	assert_success
+	assert_output "[]"
 }
 
 # =============================================================================
@@ -496,5 +547,55 @@ another plain line"
 	assert_output --partial "-newermt @"
 }
 
-# The 'sources the library' guard lives in vendored_lib.bats for this repo:
-# CNV scripts reach the library through common.sh rather than directly.
+@test "every script calling the library also sources it" {
+	# gather runs each gather_* as a separate script, so functions defined in
+	# a parent shell are not inherited. Forgetting the source is silent: the
+	# collection runs, logs nothing unusual, and gathers nothing. This cost a
+	# wasted cluster run in the ODF fork before it was caught.
+	cd "$SCRIPT_DIR"
+	local missing=""
+	for f in gather_*; do
+		if grep -qE '\b(copy_pod_dir_since|pod_tar_dirs_since|filter_names_since|since_find_predicate|trim_jsonl_since|since_report)\b' "$f"; then
+			# directly, or through a common.sh that sources it -- the
+			# CNV fork does the latter
+			grep -qE 'since_common\.sh|common\.sh' "$f" || missing="$missing $f"
+		fi
+	done
+	[ -z "$missing" ] || {
+		echo "scripts use the library but never source it:$missing" >&2
+		false
+	}
+}
+
+@test "library functions survive into an xargs/sh -c grandchild" {
+	# Collection scripts fan out with `xargs ... sh -c`, where a function from
+	# the parent shell is not visible. Without export -f the failure is quiet
+	# and expensive: $(since_find_predicate) becomes empty, find runs
+	# unfiltered, and the window is silently ignored. CNV's gather_vms_details
+	# collected a 27-minute-old QEMU log under --since 5m because of this.
+	run bash -c "
+		export MUST_GATHER_SINCE_TIME='2026-10-16T12:00:00Z'
+		source \"$SCRIPT_DIR/since_common.sh\"
+		get_since_cutoff
+		sh -c 'since_find_predicate'
+	"
+	assert_success
+	assert_output --partial "-newermt @1792152000"
+}
+
+@test "every public library function is exported" {
+	run bash -c "
+		source \"$SCRIPT_DIR/since_common.sh\"
+		missing=''
+		for f in duration_to_seconds duration_to_node_logs_since get_since_cutoff \
+			since_window_requested since_find_predicate filename_timestamp_epoch \
+			filter_names_since copy_pod_dir_since pod_tar_dirs_since \
+			trim_jsonl_since since_report since_report_header; do
+			declare -F \"\$f\" >/dev/null || { missing=\"\$missing \$f(undefined)\"; continue; }
+			[[ \$(declare -pF \"\$f\") == *' -fx '* ]] || missing=\"\$missing \$f\"
+		done
+		echo \"[\$missing]\"
+	"
+	assert_success
+	assert_output "[]"
+}
