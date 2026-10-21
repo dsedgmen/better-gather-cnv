@@ -135,6 +135,71 @@ cluster runs before it was caught.
 
 ## Images
 
+This image adds **only shell scripts** — no packages, no binaries — so every
+vulnerability it reports comes from whatever it is layered on. That makes the
+choice of base the whole of its security posture, and `Dockerfile.overlay`
+deliberately has no default: a build without `BASE` fails rather than
+silently picking something stale.
+
+### The best base is the one your cluster already runs
+
+It carries exactly the CVEs you have already accepted, and its tooling
+matches the CNV release you run:
+
+```console
+$ BASE=$(oc get csv -n openshift-cnv -o json \
+    | jq -r '..|.["operators.openshift.io/must-gather-image"]? // empty' | head -1)
+$ make image-overlay BASE="$BASE"
+```
+
+That is the `operators.openshift.io/must-gather-image` annotation, the same
+one `oc adm must-gather --all-images` reads. Not every operator build sets
+it; if it comes back empty, take the image from the operator's own
+deployment instead.
+
+Or build it inside the cluster, which needs no registry credentials at all:
+
+```console
+$ oc new-project better-gather-build
+$ oc new-build --name mg --binary --strategy=docker
+$ oc start-build mg --from-dir=. --follow
+```
+
+A scan of that image is identical to a scan of the must-gather you are
+already running. No prebuilt image can do better.
+
+### The published images
+
+For when you do not have the cluster to hand, CI publishes images built on a
+base this repo produces from `registry.access.redhat.com/ubi9/ubi-minimal`,
+which Red Hat rebuilds continuously and which needs no pull credentials:
+
+```console
+$ make image-base                                      # the UBI9 base
+$ make image-overlay BASE=better-gather-cnv-base:latest
+```
+
+`Dockerfile.base` reproduces what the upstream image provides — `oc`, the node-gather manifests, `vmConvertor` and the node
+tooling (`iproute`, `tcpdump`, `pciutils`, `nftables`) — on top
+of UBI9, because there is nothing fresher to layer onto — `latest` is the
+newest tag the community images publish, and at the time of writing:
+
+| base | last rebuilt |
+| ---- | ------------ |
+| `quay.io/openshift/origin-must-gather:latest` | 2026-02-13 |
+| `quay.io/kubevirt/must-gather:latest` | 2026-07-06 |
+| `quay.io/ocs-dev/ocs-must-gather:latest` | 2025-07-02 |
+| `registry.access.redhat.com/ubi9/ubi-minimal:latest` | rebuilt continuously |
+
+`hack/check-base.sh` reports how old a base is and fails past 60 days, and CI
+runs it before publishing, so this cannot quietly rot again. Every image
+carries `better-gather.base` and `better-gather.base-built` labels recording
+what it was built on, so a scan result is never a mystery.
+
+The UBI9 base is smaller too — 317 MB against 438 MB.
+
+### Tags
+
 CI builds the overlay image and pushes it to ghcr.io on `main`, on every
 `release-*` branch, and on a `v*` tag. Pull requests build and smoke-test but
 publish nothing.

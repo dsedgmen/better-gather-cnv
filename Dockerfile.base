@@ -1,0 +1,96 @@
+# A current base for the CNV must-gather overlay.
+#
+# The published image used to layer onto quay.io/kubevirt/must-gather:latest,
+# which has not been rebuilt in months. Dockerfile.overlay adds only shell
+# scripts, so every vulnerability a scan reported against it came from that
+# base and none of it from us.
+#
+# Upstream's own Dockerfile builds FROM registry.ci.openshift.org, which needs
+# CI credentials nobody outside OpenShift CI has, and there is no fresher
+# public CNV must-gather tag to use instead. So reproduce what that image
+# provides -- oc, the node-gathering tools, vmConvertor and the node-gather
+# manifests -- on top of UBI9 minimal, which Red Hat rebuilds continuously and
+# which needs no pull credentials.
+#
+#   make image-base
+#   make image-overlay BASE=better-gather-cnv-base:latest
+#
+# This is for the published, cluster-agnostic image. If you are collecting
+# from a cluster you have access to, prefer layering onto the CNV must-gather
+# image that cluster already advertises -- it carries exactly the CVEs you
+# have already accepted, and its tooling matches the CNV release you run.
+
+ARG UBI=registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+# gather_virtualmachines and gather_vms_details both invoke vmConvertor, so
+# the base has to carry it. The module is vendored, so this stage needs no
+# network, and go-toolset is a Red Hat image on the same rebuild cadence as
+# the runtime base.
+#
+# Pinned to BUILDPLATFORM and cross-compiled rather than run under emulation:
+# this image publishes arm64 and s390x as well, and a Go compiler running
+# under qemu-user to produce a binary Go could have cross-compiled natively
+# is minutes of CI time for nothing. CGO is off so there is no toolchain to
+# arrange.
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:latest AS go-builder
+ARG TARGETARCH
+WORKDIR /src
+COPY cmd/vmConvertor/ .
+USER 0
+RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" \
+    go build -mod=vendor -ldflags="-s -w" -o /vmConvertor .
+
+FROM ${UBI}
+
+# stable tracks the current oc release; pin to e.g. 4.18.21 to match a cluster.
+ARG OC_VERSION=stable
+# Set by buildx for each platform; defaulted so a plain `podman build` works.
+ARG TARGETARCH=amd64
+
+# Upstream's Dockerfile installs iproute, tcpdump, pciutils, util-linux,
+# nftables, rsync and jq "for gathering data from nodes"; the rest is what the
+# collection scripts themselves need:
+#   tar gzip        archive handling, and oc cp/rsync require tar in the image
+#   findutils       find, including -newermt for the --since window
+#   util-linux      flock for the task counter, column for formatted output
+#   procps-ng       pkill, used by oc's own disk-usage checker
+#   gawk sed grep   text handling throughout
+#   tzdata          so date -d and timestamps resolve sensibly
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+        iproute tcpdump pciutils util-linux nftables rsync jq \
+        tar gzip findutils procps-ng gawk sed grep \
+        curl-minimal ca-certificates tzdata bash \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64)   arch=x86_64  ;; \
+        arm64)   arch=arm64   ;; \
+        s390x)   arch=s390x   ;; \
+        ppc64le) arch=ppc64le ;; \
+        *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -sSLf --retry 3 \
+        "https://mirror.openshift.com/pub/openshift-v4/${arch}/clients/ocp/${OC_VERSION}/openshift-client-linux.tar.gz" \
+        | tar xz -C /usr/bin oc kubectl; \
+    chmod +x /usr/bin/oc /usr/bin/kubectl; \
+    oc version --client
+
+COPY --from=go-builder /vmConvertor /usr/bin/
+
+# gather_nodes applies these to stand the node-gather daemonset up.
+COPY node-gather /etc/
+
+# Read by the collection scripts to find the CNV install.
+ENV INSTALLATION_NAMESPACE=kubevirt-hyperconverged
+
+# must-gather runs with / as the working directory: the collection scripts
+# mix 'must-gather' and '../must-gather' relative paths, which only agree
+# from there.
+WORKDIR /
+
+LABEL io.k8s.display-name="better-gather-cnv-base" \
+      io.k8s.description="Current UBI9 base carrying what the CNV must-gather collection scripts use"
+
+ENTRYPOINT ["/bin/bash"]

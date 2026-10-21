@@ -1,13 +1,39 @@
 # Layer better-gather-cnv's collection scripts onto an existing CNV
-# must-gather image, so the base is version-matched to the cluster under test
-# and needs no CI credentials.
+# must-gather image.
 #
-#   make image-overlay BASE=<the cnv-must-gather image your cluster advertises>
+# BASE is deliberately not defaulted. This image adds nothing but shell
+# scripts -- no packages, no binaries -- so every CVE it carries comes from
+# whatever it is layered on, and a default would be the wrong answer most of
+# the time. quay.io/kubevirt/must-gather:latest was built 2026-07-06 and has
+# no fresher tag; building on it is how a scan ends up far worse than a stock
+# must-gather.
+#
+# The right base is the image your cluster already runs, which carries
+# exactly the CVEs you have already accepted and nothing more:
+#
+#   oc get csv -n openshift-cnv -o json \
+#     | jq -r '..|.["operators.openshift.io/must-gather-image"]? // empty'
+#
+#   make image-overlay BASE=<that image>
+#
+# Failing that, build a current one from UBI9 -- see Dockerfile.base, which
+# reproduces what the upstream image provides (oc, the node-gather manifests,
+# vmConvertor, the node tooling) on a base Red Hat rebuilds continuously:
+#
+#   make image-base
+#   make image-overlay BASE=better-gather-cnv-base:latest
+#
+# Either way the result is labelled with the base it used and when that base
+# was built, so it is never a mystery what a scan is actually reporting on.
 
-ARG BASE=quay.io/kubevirt/must-gather:latest
+ARG BASE
 FROM ${BASE}
 
 COPY collection-scripts/ /usr/bin/
 
+ARG BASE
+ARG BASE_BUILT="unknown"
 LABEL io.k8s.display-name="better-gather-cnv" \
-      io.k8s.description="CNV must-gather collection scripts that honour --since"
+      io.k8s.description="CNV must-gather collection scripts that honour --since" \
+      better-gather.base="${BASE}" \
+      better-gather.base-built="${BASE_BUILT}"

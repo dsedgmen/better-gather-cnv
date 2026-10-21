@@ -8,10 +8,15 @@
 # distribution rather than downloading release binaries from GitHub, and that
 # needs dnf. It is the same path used locally, so CI and a laptop agree.
 #
-# The image is built against a *public* base so CI needs no registry
-# credentials. For real use you want the image your cluster actually runs --
-# see Dockerfile.overlay -- but for proving the overlay builds and the
-# scripts work inside it, the public base is equivalent.
+# The image is built on a base this repo produces from UBI9 minimal, which
+# Red Hat rebuilds continuously and which needs no pull credentials. It used
+# to layer onto quay.io/kubevirt/must-gather:latest, last rebuilt in July;
+# since this image adds nothing but shell scripts, all of that staleness
+# showed up in a scan as though it were ours.
+#
+# For collecting from a cluster you have access to, prefer layering onto the
+# CNV must-gather image that cluster advertises -- see Dockerfile.overlay. It
+# carries exactly the CVEs you have already accepted.
 
 name: ci
 
@@ -23,9 +28,18 @@ on:
   workflow_dispatch:
 
 env:
-  PUBLIC_BASE: quay.io/kubevirt/must-gather:latest
   PLATFORMS: linux/amd64,linux/arm64,linux/s390x
   IMAGE_NAME: better-gather-cnv
+  # Built here from UBI9 rather than pulled: no public CNV must-gather image
+  # has been rebuilt recently enough to ship on.
+  #
+  # Via a scratch registry on the runner, not a bare local tag: buildx's
+  # docker-container driver has its own image store and cannot see what
+  # `--load` put in the docker daemon, so `FROM better-gather-cnv-base:ci` in
+  # the overlay would be resolved against Docker Hub and fail. A registry is
+  # also what makes a multi-platform base usable by the overlay build.
+  BASE_IMAGE: localhost:5000/better-gather-cnv-base:ci
+  MAX_BASE_AGE_DAYS: "60"
 
 jobs:
   lint-and-test:
@@ -60,10 +74,46 @@ jobs:
     permissions:
       contents: read
       packages: write
+    services:
+      # Somewhere for the base image to live between the two builds below.
+      # Thrown away with the runner; nothing is published from here.
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
     steps:
       - uses: actions/checkout@v4
 
+      - uses: docker/setup-qemu-action@v3
+        # The base has RUN steps, so arm64 and s390x need emulating. The Go
+        # stage cross-compiles instead -- see Dockerfile.base -- so this is
+        # only microdnf and the oc download.
+
       - uses: docker/setup-buildx-action@v3
+        with:
+          # So the builder container can reach the registry service on
+          # localhost:5000. BuildKit treats localhost registries as plain
+          # HTTP, so no certificate wrangling is needed.
+          driver-opts: network=host
+
+      - name: Build a current base from UBI9
+        # No credentials needed, and rebuilt continuously upstream, unlike
+        # every public CNV must-gather image.
+        #
+        # Every platform, not just this runner's: the overlay's push step
+        # needs a base manifest covering all of them.
+        run: |
+          docker buildx build \
+            --platform "$PLATFORMS" \
+            -f Dockerfile.base \
+            -t "$BASE_IMAGE" \
+            --push .
+
+      - name: Refuse to ship on a stale base
+        run: |
+          ./hack/check-base.sh --max-age "$MAX_BASE_AGE_DAYS" \
+            registry.access.redhat.com/ubi9/ubi-minimal:latest
 
       - name: Build for this runner and load it, so it can be tested
         # Multi-platform builds cannot be --load'ed into the local docker, so
@@ -73,7 +123,8 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            --build-arg BASE="$PUBLIC_BASE" \
+            --build-arg BASE="$BASE_IMAGE" \
+            --build-arg BASE_BUILT="$(date -u +%Y-%m-%d)" \
             -f Dockerfile.overlay \
             -t "$IMAGE_NAME:ci" \
             --load .
@@ -104,15 +155,27 @@ jobs:
             [ "$(duration_to_node_logs_since 2h30m0s)" = "150m" ]
             [ "$(duration_to_node_logs_since 500ms)" = "1s" ]
 
-            # a window produces a find predicate
+            # The find predicate is checked by what it selects rather than by
+            # how it is spelled, so that rewording it does not fail the build
+            # and changing its behaviour does.
+            cd "$(mktemp -d)"
+            touch -d "2 hours ago" live.log rotated-2024-01-01.log rotated.log.gz
+            touch recent.log
+
             MUST_GATHER_SINCE=30m0s get_since_cutoff
             [ -n "${since_cutoff_epoch}" ]
-            since_find_predicate | grep -q "^-newermt @"
+            got="$(eval "find . -type f $(since_find_predicate) -print" | sort | tr "\n" " ")"
+            # live.log predates the cutoff but is the file still being written
+            # to, so it holds the records covering the window. The rotated and
+            # compressed ones are genuinely out of it.
+            [ "$got" = "./live.log ./recent.log " ] || {
+              echo "unexpected selection: [$got]" >&2; exit 1; }
 
-            # and no window is a no-op
+            # and no window selects everything
             unset MUST_GATHER_SINCE
             get_since_cutoff
             [ -z "$(since_find_predicate)" ]
+            [ "$(eval "find . -type f $(since_find_predicate) -print" | wc -l)" -eq 4 ]
 
             echo "in-image --since library OK"
           '
@@ -158,7 +221,8 @@ jobs:
         run: |
           docker buildx build \
             --platform "$PLATFORMS" \
-            --build-arg BASE="$PUBLIC_BASE" \
+            --build-arg BASE="$BASE_IMAGE" \
+            --build-arg BASE_BUILT="$(date -u +%Y-%m-%d)" \
             -f Dockerfile.overlay \
             $(echo "${{ steps.tags.outputs.tags }}" | tr "," "\n" | sed "s/^/--tag /" | tr "\n" " ") \
             --push .
