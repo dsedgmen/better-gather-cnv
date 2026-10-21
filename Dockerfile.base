@@ -95,6 +95,9 @@ ENV INSTALLATION_NAMESPACE=kubevirt-hyperconverged
 WORKDIR /
 
 LABEL io.k8s.display-name="better-gather-cnv-base" \
-      io.k8s.description="Current UBI9 base carrying what the CNV must-gather collection scripts use"
+      io.k8s.description="Current UBI9 base carrying what the CNV must-gather collection scripts use Not a Red Hat product." \
+      better-gather.disclaimer="Not a Red Hat product: built from ubi9/ubi-minimal by an unofficial project, unsupported, no warranty." \
+      org.opencontainers.image.vendor="dsedgmen (unofficial -- not Red Hat)" \
+      org.opencontainers.image.source="https://github.com/dsedgmen/better-gather-cnv"
 
 ENTRYPOINT ["/bin/bash"]

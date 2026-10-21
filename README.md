@@ -6,6 +6,19 @@ which `--since` bounds the QEMU and node log collection. Sibling of
 [better-gather](https://github.com/dsedgmen/better-gather) (OpenShift) and
 [better-gather-odf](https://github.com/dsedgmen/better-gather-odf).
 
+> ### ⚠️ Not a Red Hat product
+>
+> This is a personal, unofficial fork. It is **not built, reviewed, supported
+> or endorsed by Red Hat**, and it is provided **without warranty or support
+> of any kind** — use it, and anything it collects, at your own risk. See
+> [`LICENSE`](LICENSE) and [`DISCLAIMER`](DISCLAIMER), a copy of which ships
+> in the image and is written into every collection it produces.
+>
+> Because `--since` really does bound collection here, an archive from this
+> tool may hold less than a stock CNV must-gather would. If you attach one to a
+> Red Hat support case, say that it came from an unofficial tool; support may
+> ask for a collection from the supported image instead.
+
 ## What was wrong
 
 `collection-scripts/common.sh` is a copy of openshift/must-gather's, so it

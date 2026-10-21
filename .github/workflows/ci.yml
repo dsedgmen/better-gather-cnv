@@ -69,6 +69,52 @@ jobs:
         # which has nothing to do with checking shell scripts.
         run: make bats-check
 
+  scan-code:
+    # Vulnerable dependencies, committed secrets and Dockerfile
+    # misconfiguration, across the whole tree including the vendored Go.
+    #
+    # Reporting only, like the image scan: this job never fails the build.
+    # Accepted findings live in .trivyignore, each with a reason -- today
+    # that is DS-0002 alone, since a must-gather image cannot run as a
+    # non-root user.
+    #
+    # `make scan-code` runs the same scan locally, with trivy from the
+    # distribution rather than from this action.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan the tree
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          skip-dirs: '**/vendor'
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: 0
+
+      - name: Keep the code scan as an artifact
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          skip-dirs: '**/vendor'
+          format: json
+          output: trivy-code.json
+          exit-code: 0
+
+      - name: Upload the code scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-code-${{ github.sha }}
+          path: trivy-code.json
+          if-no-files-found: warn
+
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -179,6 +225,38 @@ jobs:
 
             echo "in-image --since library OK"
           '
+
+      - name: Scan the image for vulnerabilities
+        # Reporting only: `exit-code: 0`. An unfixed CVE in the base is not
+        # something this repo can action -- it adds no packages of its own --
+        # and a gate nobody can satisfy only teaches people to ignore it. The
+        # staleness gate above is what actually keeps the base current, which
+        # is the part we control.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: 0
+
+      - name: Keep the image scan as an artifact
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          scanners: vuln
+          format: json
+          output: trivy-image.json
+          exit-code: 0
+
+      - name: Upload the image scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-${{ github.sha }}
+          path: trivy-image.json
+          if-no-files-found: warn
 
       - name: Work out the tags
         # main           -> :latest and :main-<sha>
