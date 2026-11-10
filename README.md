@@ -328,8 +328,17 @@ would imply a backport that does not exist.
 
 ## Staying current with upstream
 
+A scheduled workflow (`.github/workflows/sync-upstream.yml`) fetches
+[kubevirt/must-gather](https://github.com/kubevirt/must-gather) daily and
+opens a sync PR when `main` lags `upstream/main`. Sync PRs are labeled
+`upstream-sync` and wait for CI; they are not auto-merged.
+
+There is no release-branch sync here: upstream has no 4.18+ `release-*`
+lines to backport onto (see above).
+
 ```console
-$ git fetch upstream && git rebase upstream/main
+$ hack/sync-upstream.sh           # needs gh, a clean tree, and push access
+$ hack/sync-upstream.sh --dry-run
 ```
 
 ---
