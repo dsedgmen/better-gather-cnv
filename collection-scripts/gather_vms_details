@@ -4,6 +4,8 @@ DIR_NAME=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 source "${DIR_NAME}/common.sh"
 check_command
 get_log_collection_args
+get_since_cutoff
+since_report_header
 
 export QEMULOGPATH_1="/var/log/libvirt/qemu/"
 export QEMULOGPATH_2="/var/run/libvirt/qemu/log/"
@@ -47,7 +49,16 @@ function gather_vm_info() {
 
   # VM : QEMU logs
   # libvirt logs are already relayed to virt-launcher, and we capture the virt-launcher pod logs elsewhere. We are want the QEMU log here.
-  /usr/bin/oc exec "${ocvm}" -n "${ocproject}" -c compute -- tar --ignore-failed-read -cf - "${QEMULOGPATH_1}" "${QEMULOGPATH_2}" "${QEMULOGPATH_3}" | tar -C "${vm_collection_path}" --transform 's/.*\///g' -xvf -
+  # Feed tar a find-filtered file list rather than the directories, so that
+  # --since bounds what is transferred. since_find_predicate expands to
+  # nothing without a window, leaving the original behaviour. The paths are
+  # made relative to / because that is what tar stored anyway after stripping
+  # the leading slash, and what the --transform below already expects.
+  # shellcheck disable=SC2086
+  /usr/bin/oc exec "${ocvm}" -n "${ocproject}" -c compute -- \
+    sh -c "cd / && find '${QEMULOGPATH_1#/}' '${QEMULOGPATH_2#/}' '${QEMULOGPATH_3#/}' -type f $(since_find_predicate) -print0 2>/dev/null | tar --ignore-failed-read -cf - --null -T -" \
+    | tar -C "${vm_collection_path}" --transform 's/.*\///g' -xvf -
+  since_report "vms/${vmname}/qemu_logs" "find-newermt" "$(find "${vm_collection_path}" -name '*.log' 2>/dev/null | wc -l)" "pre-cutoff"
 
   # VM : IP
   /usr/bin/oc exec "${ocvm}" -n "${ocproject}" -c compute -- ip a 2>/dev/null > "${vm_collection_path}/${ocvm}.ip.txt"

@@ -1,3 +1,348 @@
+better-gather-cnv
+=================
+
+A fork of [kubevirt/must-gather](https://github.com/kubevirt/must-gather) in
+which `--since` bounds the QEMU and node log collection. Sibling of
+[better-gather](https://github.com/dsedgmen/better-gather) (OpenShift) and
+[better-gather-odf](https://github.com/dsedgmen/better-gather-odf).
+
+> ### ⚠️ Not a Red Hat product
+>
+> This is a personal, unofficial fork. It is **not built, reviewed, supported
+> or endorsed by Red Hat**, and it is provided **without warranty or support
+> of any kind** — use it, and anything it collects, at your own risk. See
+> [`LICENSE`](LICENSE) and [`DISCLAIMER`](DISCLAIMER), a copy of which ships
+> in the image and is written into every collection it produces.
+>
+> Because `--since` really does bound collection here, an archive from this
+> tool may hold less than a stock CNV must-gather would. If you attach one to a
+> Red Hat support case, say that it came from an unofficial tool; support may
+> ask for a collection from the supported image instead.
+
+## What was wrong
+
+`collection-scripts/common.sh` is a copy of openshift/must-gather's, so it
+carried the same duration bug: collapsing a Go duration for `oc adm node-logs`
+by keeping only its first component. `2h30m` became `-2h`, silently dropping
+the oldest thirty minutes of the window, and `500ms` became `-500m`, read as
+500 minutes. That reaches the real `node-logs -u NetworkManager` and
+`-u kubelet` journal queries in `gather_nodes`.
+
+The 24 `oc adm inspect ${log_collection_args}` call sites were already fine.
+The gaps were the collection that copies files:
+
+- `gather_vms_details` and `gather_vm_incident` tar whole QEMU log
+  directories out of the `compute` container —
+  `tar --ignore-failed-read -cf - /var/log/libvirt/qemu/
+  /var/run/libvirt/qemu/log/ /var/run/kubevirt-private/libvirt/qemu/log/` —
+  with no time bound at all.
+- `gather_nodes` took the node audit log with `head -c 50000000`, which is
+  the **oldest** 50 MB of the file. Independent of `--since`, that is
+  backwards for incident analysis and explains a capped `audit.log` so often
+  containing nothing relevant.
+
+## What changed
+
+Durations are now collapsed exactly (`2h30m0s` → `-150m`, `500ms` → `-1s`),
+via the vendored `since_common.sh`.
+
+Both QEMU tar sites are fed a `find`-filtered file list instead of whole
+directories, so out-of-window logs are never transferred. The existing
+`--transform` rules are untouched — they already expected member names
+without a leading slash, which is exactly what a relative `find` produces.
+
+The node audit log is filtered on auditd's own `msg=audit(<epoch>.<ms>:<seq>)`
+timestamp, in POSIX awk so it works under mawk as well as gawk. Lines that
+carry no audit timestamp pass through untouched. The 50 MB cap is now applied
+with `tail`, so what survives is the most recent 50 MB rather than the oldest.
+
+`oc cp` of `/host/${conf_dir}` and `/host/etc/pcidp/config.json` is left
+alone: that is configuration, not history, and a window does not apply.
+
+## Measured on a live cluster
+
+OpenShift Virtualization 4.18.49 on OCP 4.18.54, one cirros VM whose QEMU log
+was last written at 00:01:39Z:
+
+```
+--since 5m   (cutoff 00:26)  ->  qemu logs collected: 0   other VM artefacts: 10
+--since 2h   (cutoff 22:33)  ->  qemu logs collected: 1   other VM artefacts: 10
+
+since-report.txt:
+  vms/bg-testvm/qemu_logs   find-newermt   kept=0   (5m)
+  vms/bg-testvm/qemu_logs   find-newermt   kept=1   (2h)
+```
+
+The window is the only thing that changes; the virsh dumps, capabilities and
+domain XML are collected either way.
+
+### The node audit log
+
+Verified against a real `/var/log/audit/audit.log` (16,478 records spanning
+six weeks) on all three nodes, through the full `gather_nodes` path with the
+node-gather DaemonSet:
+
+```
+filter applied directly to the file, GNU Awk 5.1.0:
+  window     kept    oldest kept             violations
+  1h          848    2026-10-16T23:53:48Z    0
+  24h        1313    2026-10-16T01:14:18Z    0
+  30d       12505    2026-09-17T01:01:32Z    0
+  unbounded 16478    2026-09-04T09:39:54Z    0      (all of them: a no-op)
+
+through gather_nodes --since 1h, three nodes:
+  master-0  860 lines  23:56:14Z .. 00:55:07Z
+  master-1  728 lines  23:56:19Z .. 00:55:07Z
+  master-2  763 lines  23:56:19Z .. 00:55:08Z
+
+with no window, the whole file is collected as before:
+  master-0  16514 lines, oldest 2026-09-04T09:39:54Z
+  master-2  24153 lines, oldest 2026-09-04T09:26:10Z
+```
+
+Zero records older than the cutoff survived at any window.
+
+Why the cap moved from `head` to `tail`, on that same file:
+
+```
+  head -c 200000  ->  2026-09-04T09:39:54Z .. 2026-09-04T09:55:15Z
+  tail -c 200000  ->  2026-10-16T23:59:13Z .. 2026-10-17T00:54:14Z
+```
+
+`head -c` returns the *start* of the file. On any node whose audit log has
+grown past the 50 MB cap, upstream hands you records from weeks before the
+incident you are investigating.
+
+## Testing a change
+
+```console
+$ hack/try-on-cluster.sh --env USR_BIN_GATHER=1 gather_vms_details --since 30m
+$ hack/try-on-cluster.sh gather --since 30m -- --vms_details
+$ make bats-test && make bats-lint
+```
+
+`--env` exists because CNV's collection scripts are gated on
+`USR_BIN_GATHER`, which `gather` normally sets; running one on its own needs
+it. Note that `gather --vms_details` also brings up the node-gather
+DaemonSet, which takes its image from the running pod — so pass
+`--image <the cnv-must-gather image your cluster advertises>` when using the
+full entrypoint.
+
+`make bats-test` bootstraps `bats`, `shellcheck` and `shfmt` from the
+distribution via `hack/tools-from-packages.sh`, needing neither root nor
+GitHub.
+
+## The vendored library
+
+`collection-scripts/since_common.sh` is a verbatim copy of the canonical file
+in [better-gather](https://github.com/dsedgmen/better-gather); update it with
+`hack/sync-since-lib.sh` *in that repo*. `tests/vendored_lib.bats` fails on
+drift.
+
+One thing worth knowing if you extend this: the library `export -f`s its
+functions. CNV fans out with `xargs ... sh -c`, where a function from the
+parent shell is invisible, and the failure is silent —
+`$(since_find_predicate)` becomes empty, `find` runs unfiltered, and the
+window is ignored while everything looks like it worked. That cost two
+cluster runs before it was caught.
+
+## Images
+
+This image adds **only shell scripts** — no packages, no binaries — so every
+vulnerability it reports comes from whatever it is layered on. That makes the
+choice of base the whole of its security posture, and `Dockerfile.overlay`
+deliberately has no default: a build without `BASE` fails rather than
+silently picking something stale.
+
+### The best base is the one your cluster already runs
+
+It carries exactly the CVEs you have already accepted, and its tooling
+matches the CNV release you run:
+
+```console
+$ BASE=$(oc get csv -n openshift-cnv -o json \
+    | jq -r '..|.["operators.openshift.io/must-gather-image"]? // empty' | head -1)
+$ make image-overlay BASE="$BASE"
+```
+
+That is the `operators.openshift.io/must-gather-image` annotation, the same
+one `oc adm must-gather --all-images` reads. Not every operator build sets
+it; if it comes back empty, take the image from the operator's own
+deployment instead.
+
+Or build it inside the cluster, which needs no registry credentials at all:
+
+```console
+$ oc new-project better-gather-build
+$ oc new-build --name mg --binary --strategy=docker
+$ oc start-build mg --from-dir=. --follow
+```
+
+A scan of that image is identical to a scan of the must-gather you are
+already running. No prebuilt image can do better.
+
+### The published images
+
+For when you do not have the cluster to hand, CI publishes images built on a
+base this repo produces from `registry.access.redhat.com/ubi9/ubi-minimal`,
+which Red Hat rebuilds continuously and which needs no pull credentials:
+
+```console
+$ make image-base                                      # the UBI9 base
+$ make image-overlay BASE=better-gather-cnv-base:latest
+```
+
+`Dockerfile.base` reproduces what the upstream image provides — `oc`, the node-gather manifests, `vmConvertor` and the node
+tooling (`iproute`, `tcpdump`, `pciutils`, `nftables`) — on top
+of UBI9, because there is nothing fresher to layer onto — `latest` is the
+newest tag the community images publish, and at the time of writing:
+
+| base | last rebuilt |
+| ---- | ------------ |
+| `quay.io/openshift/origin-must-gather:latest` | 2026-02-13 |
+| `quay.io/kubevirt/must-gather:latest` | 2026-07-06 |
+| `quay.io/ocs-dev/ocs-must-gather:latest` | 2025-07-02 |
+| `registry.access.redhat.com/ubi9/ubi-minimal:latest` | rebuilt continuously |
+
+`hack/check-base.sh` reports how old a base is and fails past 60 days, and CI
+runs it before publishing, so this cannot quietly rot again. Every image
+carries `better-gather.base` and `better-gather.base-built` labels recording
+what it was built on, so a scan result is never a mystery.
+
+The UBI9 base is smaller too — 317 MB against 438 MB.
+
+### Tags
+
+CI builds the overlay image and pushes it to ghcr.io on `main`, on every
+`release-*` branch, and on a `v*` tag. Pull requests build and smoke-test but
+publish nothing.
+
+| ref | tags |
+| --- | --- |
+| `main` | `:latest`, `:main-<sha>` |
+| `release-4.18` | `:4.18`, `:release-4.18` |
+| `v1.2.3` | `:v1.2.3`, `:latest` |
+
+A release branch deliberately does not move `:latest`, so `--image …:4.18`
+keeps getting the 4.18 collection scripts whatever happens on main.
+
+**The packages are private**, inheriting the repository's visibility, so a
+cluster needs a pull secret — or one of the two ways round it below.
+
+### With a pull secret
+
+`--run-namespace` needs an **already privileged** namespace — the flag's own
+help says so, and it matters more than it sounds. When `oc` creates its own
+temporary namespace it also creates a ClusterRoleBinding granting
+`cluster-admin` to that namespace's `default` ServiceAccount, and labels the
+namespace for privileged pod security. With `--run-namespace` it does
+neither: it only looks the namespace up
+([`mustgather.go`](https://github.com/openshift/oc/blob/master/pkg/cli/admin/mustgather/mustgather.go),
+`getNamespace`). A plain `oc create namespace` therefore fails partway
+through collection with:
+
+```
+Error from server (Forbidden): csistoragecapacities.storage.k8s.io is forbidden:
+User "system:serviceaccount:must-gather-run:default" cannot list resource ...
+```
+
+Create it with the same labels and binding `oc` would have made:
+
+```console
+$ cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: must-gather-run
+  labels:
+    openshift.io/run-level: "0"
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+  annotations:
+    openshift.io/node-selector: ""
+EOF
+
+$ oc adm policy add-cluster-role-to-user cluster-admin -z default -n must-gather-run
+```
+
+The token for the pull secret must be a **classic** personal access token.
+GitHub's own documentation is explicit: *"GitHub Packages only supports
+authentication using a personal access token (classic)."* Fine-grained
+tokens are not accepted by ghcr.io at all, and have no `read:packages` scope
+to select — if you are looking at a scope list without it, you are on the
+fine-grained page.
+
+Settings → Developer settings → Personal access tokens → **Tokens (classic)**
+→ Generate new token (classic) → tick **`read:packages`**.
+
+```console
+$ oc create secret docker-registry ghcr \
+    --docker-server=ghcr.io \
+    --docker-username=dsedgmen \
+    --docker-password=<classic PAT with read:packages> \
+    -n must-gather-run
+$ oc secrets link default ghcr --for=pull -n must-gather-run
+
+$ oc adm must-gather \
+    --run-namespace must-gather-run \
+    --image=ghcr.io/dsedgmen/better-gather-cnv:4.18 \
+    --since 30m
+```
+
+Verified on a 4.18 cluster: with the namespace made this way a run completes
+with no Forbidden errors; with a bare `oc create namespace` it does not.
+
+### Without a token at all
+
+**Make the package public** — repository → Packages → the package → Package
+settings → Change visibility. Any cluster can then pull it with no setup.
+The repository stays private; only the image becomes readable, which does
+publish the collection scripts, since they are in the image layers.
+
+**Or build straight into the cluster's own registry**, which needs no GitHub
+credentials and no external pull at all:
+
+```console
+$ oc new-project better-gather-build
+$ oc new-build --name mg --binary --strategy=docker
+$ oc start-build mg --from-dir=. --follow
+$ oc adm must-gather \
+    --run-namespace better-gather-build \
+    --image=image-registry.openshift-image-registry.svc:5000/better-gather-build/mg:latest
+```
+
+This is how the changes here were tested; see also `hack/try-on-cluster.sh`,
+which needs neither a build nor a registry.
+
+## Release branches
+
+None. Upstream's release branches stop at `release-4.12` and development
+happens on `main`, so there is no 4.18–4.23 branch to backport onto. The
+sibling forks have `release-4.18`+ because their upstreams do.
+
+If CNV ever needs per-release pinning, the honest way is a tag on `main`
+rather than a branch invented here — a `release-4.18` identical to `main`
+would imply a backport that does not exist.
+
+## Staying current with upstream
+
+A scheduled workflow (`.github/workflows/sync-upstream.yml`) fetches
+[kubevirt/must-gather](https://github.com/kubevirt/must-gather) daily and
+opens a sync PR when `main` lags `upstream/main`. Sync PRs are labeled
+`upstream-sync` and wait for CI; they are not auto-merged.
+
+There is no release-branch sync here: upstream has no 4.18+ `release-*`
+lines to backport onto (see above).
+
+```console
+$ hack/sync-upstream.sh           # needs gh, a clean tree, and push access
+$ hack/sync-upstream.sh --dry-run
+```
+
+---
+
 # KubeVirt must-gather
 
 `must-gather` is a tool built on top of [OpenShift must-gather](https://github.com/openshift/must-gather)

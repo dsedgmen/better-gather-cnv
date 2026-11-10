@@ -2,6 +2,19 @@
 
 export BASE_COLLECTION_PATH="${BASE_COLLECTION_PATH:-/must-gather}"
 export PROS=${PROS:-5}
+
+# Say whose tool this is, in the run output and in the archive. Whoever ends
+# up reading the collection is rarely whoever ran it, and nothing else in a
+# must-gather tarball would tell them it did not come from the supported
+# image. Not fatal if the file is missing: someone may have assembled an
+# image without it.
+if [ -r /usr/share/better-gather-cnv/DISCLAIMER ]; then
+  cat /usr/share/better-gather-cnv/DISCLAIMER >&2
+  mkdir -p "${BASE_COLLECTION_PATH}"
+  cp /usr/share/better-gather-cnv/DISCLAIMER "${BASE_COLLECTION_PATH}/DISCLAIMER"
+else
+  echo "WARNING: better-gather-cnv is not a Red Hat product and is unsupported." >&2
+fi
 DIR_NAME=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 function main() {
